@@ -1,206 +1,180 @@
-
-import io
-from itertools import combinations
-
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
+"""Streamlit front-end for Pacing Lead Analyzer v2."""
 import streamlit as st
-
-from analysis_engine import (
-    infer_coordinate_columns,
-    normalize_dataframe,
-    summarize_dataset,
-    curvature_profile,
-    pairwise_alignment_summary,
-    export_report_workbook,
+import io
+from pacing_lead_curvature_webapp import (
+    run_web_analysis, run_batch_from_zip, run_comparison,
+    MATERIAL_PROPERTIES, DEFAULT_SAFETY, UNIT_LABELS,
 )
 
-st.set_page_config(page_title="4-File Graph & Diagram Builder", layout="wide")
-
-st.title("4-File Excel Upload Graph & Diagram Builder")
-st.caption(
-    "Upload up to four Excel or CSV files. The app automatically infers coordinate columns, builds multiple graphs/diagrams, and lets you download a consolidated Excel report."
-)
+st.set_page_config(page_title="Pacing Lead Analyzer v2", page_icon="\U0001fac0", layout="wide")
+STATUS_COLORS = {"PASS": "#009988", "WARNING": "#EE7733", "FAIL": "#FF0000"}
+st.title("\U0001fac0 3D Pacing Lead Curvature Amplitude Analyzer v2")
+st.caption("Upload biplane X-ray trace files, configure settings, then click Run.")
+st.divider()
 
 with st.sidebar:
-    st.header("Upload")
-    uploaded_files = st.file_uploader(
-        "Choose exactly 4 Excel/CSV files",
-        type=["xlsx", "xls", "csv"],
-        accept_multiple_files=True,
-    )
-    pair_mode = st.selectbox(
-        "Comparison mode",
-        [
-            "Automatic sequential pairs (1-2 and 3-4)",
-            "All pairwise comparisons",
-        ],
-        index=0,
-    )
-    smooth_window = st.slider("Curvature smoothing window", 1, 15, 3, 2)
-    show_markers = st.checkbox("Show point markers on line plots", value=True)
+    st.header("Settings")
+    input_unit = st.selectbox("Input coordinate units", options=["um","mm","cm"], index=0,
+        format_func=lambda u: {"um":"Micrometers","mm":"Millimeters","cm":"Centimeters"}[u])
+    st.divider()
+    st.subheader("Safety Thresholds")
+    visone_val = st.number_input("VisONE Stimulation (cm^-1)", value=0.88, step=0.01, format="%.2f")
+    resp_val = st.number_input("Respiration (cm^-1)", value=0.91, step=0.01, format="%.2f")
+    safety_thresholds = {"VisONE Stimulation": visone_val, "Respiration": resp_val}
+    st.divider()
+    st.subheader("Data Trimming")
+    trim_start = st.slider("Trim start (%)", 0, 50, 0, 1)
+    trim_end = st.slider("Trim end (%)", 0, 50, 0, 1)
+    st.divider()
+    st.subheader("Fatigue Estimation")
+    material = st.selectbox("Wire material", list(MATERIAL_PROPERTIES.keys()))
+    wire_od = st.number_input("Wire OD (mm)", value=2.0, step=0.1, format="%.1f")
+    st.divider()
+    st.subheader("Patient Notes")
+    patient_notes = st.text_area("Notes (included in report)", placeholder="e.g. Patient 42, RV lead")
+    st.divider()
+    mode = st.radio("Analysis Mode", ["Single", "Batch (ZIP)", "Comparison (A vs B)"])
 
-
-def read_table(file_obj):
-    name = file_obj.name.lower()
-    if name.endswith('.csv'):
-        return pd.read_csv(file_obj)
-    return pd.read_excel(file_obj, engine='openpyxl' if name.endswith('xlsx') else None)
-
-
-if not uploaded_files:
-    st.info("Upload four files to generate the webpage visuals and downloadable report.")
-    st.stop()
-
-if len(uploaded_files) != 4:
-    st.warning(f"You uploaded {len(uploaded_files)} file(s). This app is designed for 4 files so the full comparison dashboard can be built.")
-
-raw_tables = {}
-normalized_tables = {}
-metadata = []
-
-for up in uploaded_files:
-    df = read_table(up)
-    coords = infer_coordinate_columns(df)
-    norm = normalize_dataframe(df, source_name=up.name, coord_cols=coords)
-    raw_tables[up.name] = df
-    normalized_tables[up.name] = norm
-    metadata.append({
-        'file': up.name,
-        'row_count': len(df),
-        'column_count': len(df.columns),
-        'inferred_coordinates': ', '.join(coords) if coords else 'Not found',
-    })
-
-meta_df = pd.DataFrame(metadata)
-
-st.subheader("Upload Summary")
-st.dataframe(meta_df, use_container_width=True)
-
-# ------ overview metrics ------
-summary_frames = []
-for name, df in normalized_tables.items():
-    summary_frames.append(summarize_dataset(df, smooth_window=smooth_window))
-summary_df = pd.DataFrame(summary_frames)
-
-st.subheader("Dataset Metrics")
-st.dataframe(summary_df, use_container_width=True)
-
-# ------ overview charts ------
-color_map = {name: px.colors.qualitative.Bold[i % len(px.colors.qualitative.Bold)] for i, name in enumerate(normalized_tables.keys())}
-
-left, right = st.columns(2)
-with left:
-    fig2d = go.Figure()
-    for name, df in normalized_tables.items():
-        if {'x', 'y'}.issubset(df.columns):
-            mode = 'lines+markers' if show_markers else 'lines'
-            fig2d.add_trace(go.Scatter(
-                x=df['x'], y=df['y'], mode=mode, name=name,
-                line=dict(width=3, color=color_map[name]),
-                marker=dict(size=5),
-                text=[f"Index {i}" for i in range(len(df))],
-                hovertemplate=f"{name}<br>x=%{{x}}<br>y=%{{y}}<extra></extra>"
-            ))
-    fig2d.update_layout(title='2D Overlay Trajectory Diagram', xaxis_title='X', yaxis_title='Y', height=520)
-    st.plotly_chart(fig2d, use_container_width=True)
-
-with right:
-    has_z = any('z' in df.columns for df in normalized_tables.values())
-    if has_z:
-        fig3d = go.Figure()
-        for name, df in normalized_tables.items():
-            if {'x', 'y', 'z'}.issubset(df.columns):
-                mode = 'lines+markers' if show_markers else 'lines'
-                fig3d.add_trace(go.Scatter3d(
-                    x=df['x'], y=df['y'], z=df['z'], mode=mode, name=name,
-                    line=dict(width=6, color=color_map[name]),
-                    marker=dict(size=3),
-                    hovertemplate=f"{name}<br>x=%{{x}}<br>y=%{{y}}<br>z=%{{z}}<extra></extra>"
-                ))
-        fig3d.update_layout(title='3D Overlay Trajectory Diagram', height=520)
-        st.plotly_chart(fig3d, use_container_width=True)
+if mode == "Single":
+    st.subheader("Upload 4 Files")
+    c1, c2 = st.columns(2)
+    with c1:
+        fi = st.file_uploader("Front Inhale", type=["csv","xlsx","xls"], key="fi")
+        fe = st.file_uploader("Front Exhale", type=["csv","xlsx","xls"], key="fe")
+    with c2:
+        si = st.file_uploader("Side Inhale", type=["csv","xlsx","xls"], key="si")
+        se = st.file_uploader("Side Exhale", type=["csv","xlsx","xls"], key="se")
+    if all([fi, si, fe, se]):
+        if st.button("Run Analysis", type="primary", use_container_width=True):
+            with st.spinner("Analyzing..."):
+                output = run_web_analysis(
+                    {"front_inhale": io.BytesIO(fi.getvalue()), "side_inhale": io.BytesIO(si.getvalue()),
+                     "front_exhale": io.BytesIO(fe.getvalue()), "side_exhale": io.BytesIO(se.getvalue())},
+                    input_unit, float(trim_start), float(trim_end),
+                    safety_thresholds, patient_notes, wire_od, material)
+            ul = output.get("unit_label", "um")
+            if not output["table"].empty:
+                st.success("Analysis complete!")
+                st.divider()
+                st.subheader("Results")
+                for card in output.get("summary_cards", []):
+                    status = card["status"]
+                    color = STATUS_COLORS.get(status, "#333")
+                    st.markdown(f"#### {card['name']} <span style='color:{color};font-weight:bold'>[{status}]</span>", unsafe_allow_html=True)
+                    c1,c2,c3,c4 = st.columns(4)
+                    c1.metric("Peak Ca (cm^-1)", f"{card['max_ca']:.4f}")
+                    c2.metric("Mean Ca (cm^-1)", f"{card['mean_ca']:.4f}")
+                    c3.metric(f"Inhale Len ({ul})", f"{card['inhale_length']:.1f}")
+                    c4.metric(f"Exhale Len ({ul})", f"{card['exhale_length']:.1f}")
+                    c5,c6,c7,c8 = st.columns(4)
+                    c5.metric(f"Arc at Peak ({ul})", f"{card['arc_at_max']:.1f}")
+                    c6.metric(f"Total Arc ({ul})", f"{card['total_arc']:.1f}")
+                    c7.metric("Peaks", f"{card['n_peaks']}")
+                    fat = card.get("fatigue")
+                    if fat and "estimated_cycles" in fat:
+                        cyc = fat["estimated_cycles"]
+                        cyc_str = "inf" if cyc == float("inf") else f"{int(cyc):,}"
+                        c8.metric("Fatigue Life", cyc_str + " cyc")
+                        st.caption(f"{fat['fatigue_status']} | Strain: {fat['bending_strain']:.4f} | {material}")
+                    st.markdown("---")
+                dl1, dl2 = st.columns(2)
+                dl1.download_button("Download CSV", data=output["table"].to_csv(index=False),
+                    file_name="curvature_results.csv", mime="text/csv")
+                if output.get("html_report"):
+                    dl2.download_button("Download HTML Report", data=output["html_report"],
+                        file_name="curvature_report.html", mime="text/html")
+                st.divider()
+                st.subheader("3-D Wire Reconstruction")
+                if output["plot_3d"]:
+                    st.plotly_chart(output["plot_3d"], use_container_width=True)
+                st.subheader("Curvature Heatmap")
+                if output.get("plot_heatmap"):
+                    st.plotly_chart(output["plot_heatmap"], use_container_width=True)
+                st.subheader("Inhale/Exhale Animation")
+                if output.get("plot_morph") and isinstance(output["plot_morph"], dict):
+                    for cn, fig in output["plot_morph"].items():
+                        st.plotly_chart(fig, use_container_width=True)
+                st.divider()
+                st.subheader("Curvature Amplitude vs Arc Length")
+                if output["plot_ca"] and isinstance(output["plot_ca"], dict):
+                    for cn, fig in output["plot_ca"].items():
+                        st.plotly_chart(fig, use_container_width=True)
+                st.divider()
+                st.subheader("Calculation Transparency")
+                for cn, steps in output.get("calc_breakdowns", {}).items():
+                    with st.expander(f"{cn} - Step-by-Step"):
+                        for s in steps:
+                            st.markdown(f"**{s['step']}**")
+                            st.write(s.get("desc", ""))
+                            if "formula" in s: st.code(s["formula"], language="text")
+                            if "detail" in s: st.caption(s["detail"])
+                            st.markdown("---")
+                with st.expander("Processing Log"):
+                    st.code("\n".join(output["log"]), language="text")
+            else:
+                st.error("Analysis failed.")
+                with st.expander("Log", expanded=True):
+                    st.code("\n".join(output["log"]), language="text")
     else:
-        st.info("No Z column was detected, so the 3D overlay diagram is skipped.")
+        st.info("Upload all 4 files to begin.")
 
-# ------ per-file graphs ------
-st.subheader("Per-File Graphs & Diagrams")
-for name, df in normalized_tables.items():
-    s1, s2 = st.columns(2)
-    with s1:
-        sub = go.Figure()
-        mode = 'lines+markers' if show_markers else 'lines'
-        sub.add_trace(go.Scatter(x=df['point_index'], y=df['x'], name='X', mode=mode))
-        sub.add_trace(go.Scatter(x=df['point_index'], y=df['y'], name='Y', mode=mode))
-        if 'z' in df.columns:
-            sub.add_trace(go.Scatter(x=df['point_index'], y=df['z'], name='Z', mode=mode))
-        sub.update_layout(title=f'{name} Coordinate Profile', xaxis_title='Point Index', yaxis_title='Coordinate Value', height=420)
-        st.plotly_chart(sub, use_container_width=True)
-    with s2:
-        curv = curvature_profile(df, smooth_window=smooth_window)
-        cfig = go.Figure()
-        cfig.add_trace(go.Scatter(x=curv['point_index'], y=curv['curvature'], mode=mode, name='Curvature'))
-        cfig.add_trace(go.Scatter(x=curv['point_index'], y=curv['step_length'], mode=mode, name='Step Length'))
-        cfig.update_layout(title=f'{name} Curvature / Step-Length Profile', xaxis_title='Point Index', height=420)
-        st.plotly_chart(cfig, use_container_width=True)
+elif mode == "Batch (ZIP)":
+    st.subheader("Batch Processing")
+    st.caption("Upload a .zip with subfolders containing 4 files each (front/side x inhale/exhale in filenames).")
+    zip_file = st.file_uploader("Upload ZIP", type=["zip"], key="batch_zip")
+    if zip_file and st.button("Run Batch", type="primary", use_container_width=True):
+        with st.spinner("Processing batch..."):
+            result = run_batch_from_zip(zip_file.getvalue(), input_unit,
+                float(trim_start), float(trim_end), safety_thresholds, wire_od, material)
+        if not result["master_table"].empty:
+            st.success(f"{len(result['master_table'])} results!")
+            st.dataframe(result["master_table"], use_container_width=True)
+            st.download_button("Master CSV", data=result["master_table"].to_csv(index=False),
+                file_name="batch_results.csv", mime="text/csv")
+        else:
+            st.error("No results.")
+        if result["errors"]:
+            with st.expander("Errors"):
+                for e in result["errors"]: st.warning(e)
 
-# ------ pair comparisons ------
-st.subheader("Comparisons")
-file_names = list(normalized_tables.keys())
-if pair_mode.startswith('Automatic') and len(file_names) >= 4:
-    pairs = [(file_names[0], file_names[1]), (file_names[2], file_names[3])]
-else:
-    pairs = list(combinations(file_names, 2))
-
-pair_summaries = []
-for a, b in pairs:
-    comp = pairwise_alignment_summary(normalized_tables[a], normalized_tables[b], a, b)
-    pair_summaries.append(comp)
-
-pair_df = pd.DataFrame(pair_summaries)
-st.dataframe(pair_df, use_container_width=True)
-
-for pair in pair_summaries:
-    a, b = pair['file_a'], pair['file_b']
-    st.markdown(f"#### {a} vs {b}")
+elif mode == "Comparison (A vs B)":
+    st.subheader("Side-by-Side Comparison")
     ca, cb = st.columns(2)
     with ca:
-        fig = go.Figure()
-        dfa, dfb = normalized_tables[a], normalized_tables[b]
-        mode = 'lines+markers' if show_markers else 'lines'
-        fig.add_trace(go.Scatter(x=dfa['x'], y=dfa['y'], mode=mode, name=a, line=dict(width=3)))
-        fig.add_trace(go.Scatter(x=dfb['x'], y=dfb['y'], mode=mode, name=b, line=dict(width=3)))
-        fig.update_layout(title='Overlay XY Comparison', xaxis_title='X', yaxis_title='Y', height=420)
-        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("#### Lead A")
+        a_fi = st.file_uploader("A: Front Inhale", type=["csv","xlsx","xls"], key="a_fi")
+        a_si = st.file_uploader("A: Side Inhale", type=["csv","xlsx","xls"], key="a_si")
+        a_fe = st.file_uploader("A: Front Exhale", type=["csv","xlsx","xls"], key="a_fe")
+        a_se = st.file_uploader("A: Side Exhale", type=["csv","xlsx","xls"], key="a_se")
     with cb:
-        dist_fig = go.Figure()
-        dist_fig.add_trace(go.Scatter(
-            x=pair['distance_profile']['point_index'],
-            y=pair['distance_profile']['distance'],
-            mode=mode,
-            name='Point-to-point distance'
-        ))
-        dist_fig.update_layout(title='Point-to-Point Distance Profile', xaxis_title='Aligned Point Index', yaxis_title='Distance', height=420)
-        st.plotly_chart(dist_fig, use_container_width=True)
-
-# ------ downloads ------
-report_buffer = export_report_workbook(normalized_tables, summary_df, pair_df)
-
-st.subheader("Download")
-st.download_button(
-    label="Download consolidated Excel report",
-    data=report_buffer.getvalue(),
-    file_name="four_file_visual_report.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
-
-csv_buffer = io.StringIO()
-summary_df.to_csv(csv_buffer, index=False)
-st.download_button(
-    label="Download summary metrics CSV",
-    data=csv_buffer.getvalue(),
-    file_name="four_file_summary_metrics.csv",
-    mime="text/csv",
-)
+        st.markdown("#### Lead B")
+        b_fi = st.file_uploader("B: Front Inhale", type=["csv","xlsx","xls"], key="b_fi")
+        b_si = st.file_uploader("B: Side Inhale", type=["csv","xlsx","xls"], key="b_si")
+        b_fe = st.file_uploader("B: Front Exhale", type=["csv","xlsx","xls"], key="b_fe")
+        b_se = st.file_uploader("B: Side Exhale", type=["csv","xlsx","xls"], key="b_se")
+    if all([a_fi,a_si,a_fe,a_se]) and all([b_fi,b_si,b_fe,b_se]):
+        if st.button("Compare", type="primary", use_container_width=True):
+            with st.spinner("Comparing..."):
+                fa = {"front_inhale":io.BytesIO(a_fi.getvalue()),"side_inhale":io.BytesIO(a_si.getvalue()),
+                      "front_exhale":io.BytesIO(a_fe.getvalue()),"side_exhale":io.BytesIO(a_se.getvalue())}
+                fb = {"front_inhale":io.BytesIO(b_fi.getvalue()),"side_inhale":io.BytesIO(b_si.getvalue()),
+                      "front_exhale":io.BytesIO(b_fe.getvalue()),"side_exhale":io.BytesIO(b_se.getvalue())}
+                comp = run_comparison(fa, fb, "Lead A", "Lead B", input_unit,
+                    float(trim_start), float(trim_end), safety_thresholds, wire_od, material)
+            if not comp["comparison_table"].empty:
+                st.success("Comparison complete!")
+                st.dataframe(comp["comparison_table"], use_container_width=True)
+                st.download_button("Comparison CSV", data=comp["comparison_table"].to_csv(index=False),
+                    file_name="comparison.csv", mime="text/csv")
+                st.divider()
+                la, lb = st.columns(2)
+                with la:
+                    st.markdown("### Lead A")
+                    if comp["lead_a"].get("plot_3d"): st.plotly_chart(comp["lead_a"]["plot_3d"], use_container_width=True)
+                with lb:
+                    st.markdown("### Lead B")
+                    if comp["lead_b"].get("plot_3d"): st.plotly_chart(comp["lead_b"]["plot_3d"], use_container_width=True)
+            else:
+                st.error("Comparison failed.")
+    else:
+        st.info("Upload all 8 files (4 per lead) to compare.")
